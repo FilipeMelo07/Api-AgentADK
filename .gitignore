@@ -1,0 +1,12 @@
+# Ambientes virtuais
+.venv/
+venv/
+env/
+.adk/
+
+# Variáveis de ambiente (Segurança)
+.env
+
+# Arquivos compilados/cache do Python
+__pycache__/
+*.pyc
