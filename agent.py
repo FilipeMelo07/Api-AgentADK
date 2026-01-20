@@ -1,4 +1,5 @@
 import os
+import json
 from dotenv import load_dotenv
 import requests
 from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
@@ -145,13 +146,22 @@ google_search_tool = types.Tool(google_search=types.GoogleSearchRetrieval)
 
 # A. Prompts
 PROMPT_CLASSIFICADOR = """
-Você é um roteador de intenções. Analise a frase do usuário e responda APENAS com uma das palavras abaixo:
+Você é um roteador de intenções. 
+Analise a frase do usuário e retorne EXATAMENTE e APENAS um JSON com as chaves "tipo" e "termo_busca".
 
-"OFERTAS" -> Se o usuário quer comprar, saber preço, ver promoções, links de lojas ou "onde comprar".
-"CHAT" -> Se o usuário quer saber especificações técnicas, história, opiniões, dúvidas gerais ou conversar, sem intenção explícita de compra imediata.
+Regras:
+1. Se o usuário quer comprar, saber preço, ver ofertas ou onde comprar:
+   - "tipo": "OFERTAS"
+   - "termo_busca": O nome do produto limpo (ex: "iPhone 15", "Geladeira Frost Free").
+
+2. Se for dúvida técnica, conversa, "o que é", curiosidade ou se não houver intenção clara de compra:
+   - "tipo": "CHAT"
+   - "termo_busca": null
 
 Frase: {query}
-Resposta:
+
+Resposta Obrigatória (JSON):
+{{"tipo": "OFERTAS", "termo_busca": "..."}} ou {{"tipo": "CHAT", "termo_busca": null}}
 """
 
 PROMPT_BUSCA_RIGIDA = """
@@ -168,35 +178,75 @@ FORMATO OBRIGATÓRIO:
 """
 
 PROMPT_CHAT_AMIGAVEL = """
-Você é um assistente especialista em produtos e tecnologia.
-Responda a dúvida do usuário de forma útil, clara e simpática. 
-Use a ferramenta de busca do Google para trazer informações atualizadas se necessário (specs, lançamentos, reviews).
-Não liste preços ou links de compra nesta resposta, foque na qualidade e nas características do produto.
+Você é o "Assistente Busca Preço", um curador inteligente especializado em encontrar os melhores produtos para o usuário.
+
+SUAS REGRAS DE COMPORTAMENTO:
+
+1. IDENTIDADE: Se o usuário perguntar quem você é ou o que você faz, responda que você é um curador de produtos e que sua funcionalidade principal é pesquisar ofertas e comparar preços de mercado.
+
+2. CONCISÃO EXTREMA: Ao explicar sobre um produto ou tecnologia, seja direto. Evite textos longos ou técnicos demais. Resuma os pontos-chave (specs principais) em no máximo um parágrafo curto (3 a 4 frases). O usuário quer uma visão geral rápida, não um manual.
+
+3. SEM PREÇOS AGORA: Não forneça listas de preços ou links nesta resposta. Foque apenas em tirar a dúvida ou explicar o produto.
+
+4. FORMATATAÇÃO: Não use Markdown (negrito, itálico, tópicos). Envie apenas texto puro e limpo.
 """
 
+
 # B. Funções de Execução
-def detectar_intencao(query: str) -> str:
-    """Usa um modelo rápido para decidir o caminho."""
+def detectar_intencao(query: str) -> dict:
+    response = None # Inicializa para evitar erro no 'except'
     try:
         response = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=PROMPT_CLASSIFICADOR.format(query=query),
-            config=types.GenerateContentConfig(temperature=0.0)
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                response_mime_type="application/json" 
+            )
         )
-        intencao = response.text.strip().upper()
-        if "OFERTA" in intencao or "COMPRAR" in intencao or "PREÇO" in intencao:
-            return "OFERTAS"
-        return "CHAT"
-    except Exception as e:
-        print(f"Erro na classificação: {e}")
-        return "CHAT" 
+        
+        texto_original = response.text
+        # DEBUG: Mostra exatamente o que o Gemini mandou
+        print(f"--- ROTEADOR RAW: {texto_original} ---") 
 
-def executar_busca_ofertas(query: str) -> AgentResponse:
-    """Executa a lógica antiga de buscar links e formatar JSON."""
-    termos_reforco = "comprar menor preço barato promoção oferta brasil online"
-    query_especializada = f"{termos_reforco} {query}"
+        # 1. Limpeza (se necessário)
+        texto_limpo = texto_original.strip()
+        if texto_limpo.startswith("```"):
+            texto_limpo = texto_limpo.replace("```json", "").replace("```", "")
+        
+        # 2. Parsing seguro
+        try:
+            dados = json.loads(texto_limpo)
+        except json.JSONDecodeError:
+            print("--- ERRO: JSON inválido retornado pelo modelo.")
+            return {"tipo": "CHAT", "termo_busca": None}
+
+        # 3. Validação de Chaves (Usa .get para não quebrar com KeyError)
+        tipo = dados.get("tipo", "CHAT") # Se não tiver 'tipo', assume CHAT
+        termo = dados.get("termo_busca")
+
+        # Se for OFERTAS mas não tem termo, vira CHAT
+        if tipo == "OFERTAS" and not termo:
+             print("--- AVISO: Oferta sem termo de busca. Fallback para CHAT.")
+             return {"tipo": "CHAT", "termo_busca": None}
+             
+        return {"tipo": tipo, "termo_busca": termo}
+
+    except Exception as e:
+        print(f"ERRO CRÍTICO NO ROTEADOR: {e}")
+        # Agora conseguimos ver o texto mesmo no erro
+        if response:
+            print(f"Conteúdo que causou erro: {response.text}")
+        return {"tipo": "CHAT", "termo_busca": None}
+
+def executar_busca_ofertas(termo_limpo: str) -> AgentResponse:
+    """Busca ofertas usando o termo já limpo pelo roteador."""
     
-    print(f"--- MODO OFERTAS: {query} ---")
+    # Observe que aqui usamos termo_limpo, e não a frase inteira
+    print(f"--- MODO OFERTAS: {termo_limpo} ---")
+    
+    termos_reforco = "comprar menor preço barato promoção oferta brasil online"
+    query_especializada = f"{termos_reforco} {termo_limpo}"
     
     try:
         response = client.models.generate_content(
@@ -213,9 +263,9 @@ def executar_busca_ofertas(query: str) -> AgentResponse:
         if response.candidates and response.candidates[0].grounding_metadata:
             ofertas = injetor_de_links(response.text, response.candidates[0].grounding_metadata)
         
-        msg = f"Encontrei estas ofertas para {query}:"
+        msg = f"Encontrei estas ofertas para {termo_limpo}:"
         if not ofertas:
-            msg = "Busquei ofertas, mas não consegui validar os links no momento. Tente novamente sendo mais específico."
+            msg = f"Busquei ofertas para '{termo_limpo}', mas não consegui validar links."
 
         return AgentResponse(
             tipo="ofertas",
@@ -247,14 +297,29 @@ def executar_chat_geral(query: str) -> AgentResponse:
         )
     except Exception as e:
         return AgentResponse(tipo="erro", mensagem="Desculpe, não consegui processar sua pergunta.", ofertas=[])
-
+    
+def limpar_json(texto_sujo: str) -> str:
+    """Remove crases de markdown (```json ... ```) se existirem."""
+    texto_limpo = texto_sujo.strip()
+    if texto_limpo.startswith("```"):
+        # Remove a primeira linha (```json) e a última (```)
+        linhas = texto_limpo.splitlines()
+        if len(linhas) >= 3:
+            texto_limpo = "\n".join(linhas[1:-1])
+        else:
+            texto_limpo = texto_limpo.replace("```json", "").replace("```", "")
+    return texto_limpo.strip()
 
 def processar_solicitacao(query: str):
-    # 1. Detectar Intenção
-    intencao = detectar_intencao(query)
+    # 1. Detectar Intenção e Extrair (1 chamada apenas)
+    dados_intencao = detectar_intencao(query)
+    tipo = dados_intencao.get("tipo")
+    produto = dados_intencao.get("termo_busca")
     
     # 2. Roteamento
-    if intencao == "OFERTAS":
-        return executar_busca_ofertas(query)
+    if tipo == "OFERTAS" and produto:
+        # Passamos o produto limpo (ex: "iPhone 15")
+        return executar_busca_ofertas(produto) 
     else:
+        # No chat, passamos a query original para manter o contexto da conversa
         return executar_chat_geral(query)
